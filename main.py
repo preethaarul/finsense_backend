@@ -1,11 +1,16 @@
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+
 from fastapi import FastAPI, Depends, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from collections import defaultdict
 from datetime import datetime
-import statistics
-import numpy as np
 from typing import Dict, Optional, List
 
 from fastapi.security import OAuth2PasswordBearer
@@ -38,9 +43,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -52,11 +60,7 @@ def get_db():
         db.close()
 
 
-import os
-
-SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = os.getenv("ALGORITHM", "HS256")
-
+print("SECRET_KEY loaded:", bool(SECRET_KEY))
 
 @app.get("/")
 def root():
@@ -417,37 +421,7 @@ def rule_insights(
     }
 
 
-from sklearn.ensemble import IsolationForest
 
-@app.get("/dashboard/ml-insights")
-def ml_insights(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    expenses = db.query(Transaction).filter(
-        Transaction.user_id == current_user.id,
-        Transaction.type == "expense"
-    ).all()
-
-    if len(expenses) < 3:
-        return {"anomalies": []}
-
-    X = np.array([[e.amount] for e in expenses])
-    model = IsolationForest(contamination=0.1, random_state=42)
-    preds = model.fit_predict(X)
-
-    anomalies = []
-    for i, p in enumerate(preds):
-        if p == -1:
-            e = expenses[i]
-            anomalies.append({
-                "id": e.id,
-                "amount": e.amount,
-                "category": e.category,
-                "date": e.date
-            })
-
-    return {"anomalies": anomalies}
 
 
 @app.get("/profile")
@@ -569,3 +543,150 @@ def export_transactions(
             )
         }
     )
+
+
+
+
+
+import re
+
+@app.post("/transactions/parse-sms")
+def parse_sms(payload: Dict, current_user: User = Depends(get_current_user)):
+    text = payload.get("text", "")
+    
+    # 1. Detect Amount (₹, Rs., Rs, INR)
+    amount_match = re.search(r'(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d{2})?)', text, re.IGNORECASE)
+    amount = 0.0
+    if amount_match:
+        amount_str = amount_match.group(1).replace(',', '')
+        amount = float(amount_str)
+    
+    # 2. Detect Type (Debited/Spent -> Expense, Credited/Received -> Income)
+    type_val = "expense" # Default
+    if re.search(r'(credited|received|income|added)', text, re.IGNORECASE):
+        type_val = "income"
+    elif re.search(r'(debited|spent|paid|payment)', text, re.IGNORECASE):
+        type_val = "expense"
+        
+    # 3. Detect Date (DD-MM-YY, DD-MM-YYYY, YYYY-MM-DD)
+    date_val = datetime.now().strftime("%Y-%m-%d")
+    date_match = re.search(r'(\d{2}[-/]\d{2}[-/]\d{2,4})|(\d{4}[-/]\d{2}[-/]\d{2})', text)
+    if date_match:
+        try:
+            raw_date = date_match.group(0).replace('/', '-')
+            # Simple normalization for common formats
+            parts = raw_date.split('-')
+            if len(parts[0]) == 4: # YYYY-MM-DD
+                date_val = raw_date
+            elif len(parts[2]) == 4: # DD-MM-YYYY
+                date_val = f"{parts[2]}-{parts[1]}-{parts[0]}"
+            elif len(parts[2]) == 2: # DD-MM-YY
+                date_val = f"20{parts[2]}-{parts[1]}-{parts[0]}"
+        except:
+            pass
+
+    # 4. Detect Category (Very basic keyword matching)
+    category = "Others"
+    categories = {
+        "Food": ["swiggy", "zomato", "restaurant", "starbucks", "food"],
+        "Shopping": ["amazon", "flipkart", "myntra", "shopping", "mall"],
+        "Transport": ["uber", "ola", "petrol", "fuel", "transport"],
+        "Entertainment": ["netflix", "prime", "movie", "theatre"],
+        "Bills": ["electricity", "recharge", "bill", "broadband", "water"],
+    }
+    
+    for cat, keywords in categories.items():
+        if any(kw in text.lower() for kw in keywords):
+            category = cat
+            break
+
+    return {
+        "amount": amount,
+        "type": type_val,
+        "date": date_val,
+        "category": category,
+        "description": "Parsed from SMS"
+    }
+
+@app.get("/predictions")
+def get_predictions(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Fetch all past expenses
+    expenses = db.query(Transaction).filter(
+        Transaction.user_id == current_user.id,
+        Transaction.type == "expense"
+    ).all()
+
+    if len(expenses) < 5:
+        return {
+            "status": "insufficient_data",
+            "message": "We need at least 5 transactions to start making accurate predictions."
+        }
+    # Group by month
+    monthly_totals = defaultdict(float)
+    category_monthly = defaultdict(lambda: defaultdict(float))
+    
+    current_month_key = datetime.now().strftime("%Y-%m")
+    
+    # Get last month key for comparison
+    last_month_date = datetime.now().replace(day=1)
+    if last_month_date.month == 1:
+        last_month_key = f"{last_month_date.year - 1}-12"
+    else:
+        last_month_key = f"{last_month_date.year}-{last_month_date.month - 1:02d}"
+
+    for e in expenses:
+        month_key = e.date[:7] # YYYY-MM
+        monthly_totals[month_key] += e.amount
+        category_monthly[e.category][month_key] += e.amount
+
+    # Calculate overall forecast (simple average of last 3 months if available)
+    sorted_months = sorted(monthly_totals.keys())
+    # Exclude current incomplete month if needed, but let's keep it simple for now
+    last_3_months = [m for m in sorted_months if m < current_month_key][-3:]
+    if not last_3_months: last_3_months = sorted_months[-1:]
+    
+    avg_total = sum(monthly_totals[m] for m in last_3_months) / len(last_3_months)
+    
+    # Category projections
+    category_projections = []
+    category_suggestions = []
+
+    for cat, months in category_monthly.items():
+        # Average of this category across the same last 3 months
+        cat_avg = sum(months.get(m, 0) for m in last_3_months) / len(last_3_months)
+        last_month_actual = months.get(last_month_key, 0)
+        
+        # Trend based on comparison with last active month
+        if last_month_actual > 0:
+            change_pct = ((cat_avg - last_month_actual) / last_month_actual) * 100
+            trend = "increasing" if cat_avg > last_month_actual else "decreasing"
+        else:
+            change_pct = 0
+            trend = "stable"
+            
+        category_projections.append({
+            "category": cat,
+            "predicted": round(cat_avg, 2),
+            "last_month": round(last_month_actual, 2),
+            "change_pct": round(change_pct, 1),
+            "trend": trend
+        })
+
+        if trend == "increasing" and cat_avg > (avg_total * 0.2):
+            category_suggestions.append(f"Your spending in **{cat}** is projected to rise by {abs(round(change_pct, 1))}% compared to last month. Try to find alternatives!")
+        elif cat_avg > (avg_total * 0.4):
+            category_suggestions.append(f"**{cat}** remains your biggest cost driver. Can you cut down 10% here?")
+
+    if not category_suggestions:
+        category_suggestions.append("Your spending habits look stable! Keep tracking to maintain this financial health.")
+
+    return {
+        "status": "success",
+        "forecasted_total": round(avg_total, 2),
+        "last_month_total": round(monthly_totals.get(last_month_key, 0), 2),
+        "category_projections": category_projections,
+        "suggestions": category_suggestions
+    }
